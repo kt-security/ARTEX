@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,7 +67,8 @@ func collectorConfiguredError() error {
 }
 
 // collectorEnqueue 入队一个采集 job；返回 (jobID, error)。
-func collectorEnqueue(ctx context.Context, query string, maxPages int, reason, createdBy string) (int64, error) {
+// cveID 非空时原样带给采集器（落 shodan_collect_jobs.cve_id），供 CVE 详情页反查任务。
+func collectorEnqueue(ctx context.Context, query string, maxPages int, reason, cveID, createdBy string) (int64, error) {
 	base := strings.TrimRight(strings.TrimSpace(os.Getenv(envCollectorURL)), "/")
 	if base == "" {
 		return 0, collectorConfiguredError()
@@ -76,7 +78,7 @@ func collectorEnqueue(ctx context.Context, query string, maxPages int, reason, c
 	}
 	body, err := json.Marshal(map[string]any{
 		"query": query, "max_pages": maxPages,
-		"reason": reason, "created_by": createdBy,
+		"reason": reason, "cve_id": strings.TrimSpace(cveID), "created_by": createdBy,
 	})
 	if err != nil {
 		return 0, err
@@ -140,6 +142,96 @@ func collectorStats(ctx context.Context) (map[string]int64, error) {
 	return out, json.NewDecoder(resp.Body).Decode(&out)
 }
 
+// collectorGet 向采集器发一条带鉴权的 GET，把 JSON 响应反序列化进 out。
+// 逐任务列表/详情共用（kt-vuln#73）：鉴权头、UA、超时、错误文案只写一份。
+func collectorGet(ctx context.Context, path string, out any) error {
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv(envCollectorURL)), "/")
+	if base == "" {
+		return collectorConfiguredError()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", collectorUserAgent)
+	if auth, err := collectorAuthHeader(); err != nil {
+		return err
+	} else if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := (&http.Client{Timeout: collectorTimeout}).Do(req)
+	if err != nil {
+		return fmt.Errorf("采集器不可达: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errCollectorNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		return fmt.Errorf("采集器 HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(out)
+}
+
+// errCollectorNotFound 采集器回 404（job 不存在），与「采集器不可达」区分开。
+var errCollectorNotFound = errors.New("任务不存在")
+
+// errJobNotCancellable 采集器回 409：任务已开跑或已结束，不能撤销。
+var errJobNotCancellable = errors.New("任务已开始或已结束，不能撤销")
+
+// collectorCancel 撤销一条待采集 job（kt-vuln#73：低质量查询不用继续烧 credit）。
+func collectorCancel(ctx context.Context, id int64) error {
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv(envCollectorURL)), "/")
+	if base == "" {
+		return collectorConfiguredError()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		base+"/jobs/"+strconv.FormatInt(id, 10)+"/cancel", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", collectorUserAgent)
+	if auth, err := collectorAuthHeader(); err != nil {
+		return err
+	} else if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := (&http.Client{Timeout: collectorTimeout}).Do(req)
+	if err != nil {
+		return fmt.Errorf("采集器不可达: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusNotFound:
+		return errCollectorNotFound
+	case http.StatusConflict:
+		return errJobNotCancellable
+	default:
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		return fmt.Errorf("采集器 HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+	}
+}
+
+// queueCloudJob 是采集器任务（shodan_collect_jobs 一行）的读模型镜像，字段与
+// collector internal/queue.JobRecord 的 JSON 对齐。Agent 工具用它渲染最近任务。
+type queueCloudJob struct {
+	ID            int64  `json:"id"`
+	Query         string `json:"query"`
+	MaxPages      int    `json:"max_pages"`
+	CveID         string `json:"cve_id,omitempty"`
+	CreatedBy     string `json:"created_by"`
+	Status        string `json:"status"`
+	LastPage      int    `json:"last_page"`
+	CreditsSpent  int64  `json:"credits_spent"`
+	AssetsWritten int64  `json:"assets_written"`
+	Note          string `json:"note,omitempty"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
 // ---- HTTP 端点（admin 门：采集花 credit，只允许管理员触发）----
 
 func (s *Server) shodanCollect(w http.ResponseWriter, r *http.Request) {
@@ -163,16 +255,69 @@ func (s *Server) shodanCollect(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), collectorTimeout)
 	defer cancel()
-	jobID, err := collectorEnqueue(ctx, in.Query, in.MaxPages, reason, "artex-web")
+	jobID, err := collectorEnqueue(ctx, in.Query, in.MaxPages, reason, in.CveID, "artex-web")
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"job_id": jobID, "query": in.Query,
+		"job_id": jobID, "query": in.Query, "cve_id": in.CveID,
 		"message": fmt.Sprintf("已入队（job #%d），采集器将按队列执行并自动入库", jobID),
 	})
+}
+
+// shodanCollectJobs GET /api/vuln/shodan-collect/jobs
+// 逐任务列表（kt-vuln#73 可观测性）：前端「采集任务」页的数据源。
+// 查询参数 status / cve_id / q / limit / offset 原样透传给采集器，非法值由采集器收敛。
+func (s *Server) shodanCollectJobs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	vals := url.Values{}
+	for _, k := range []string{"status", "cve_id", "q", "limit", "offset"} {
+		if v := strings.TrimSpace(q.Get(k)); v != "" {
+			vals.Set(k, v)
+		}
+	}
+	path := "/jobs"
+	if enc := vals.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), collectorTimeout)
+	defer cancel()
+	var out struct {
+		Items  []json.RawMessage `json:"items"`
+		Total  int64             `json:"total"`
+		Limit  int               `json:"limit"`
+		Offset int               `json:"offset"`
+	}
+	if err := collectorGet(ctx, path, &out); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// shodanCollectJob GET /api/vuln/shodan-collect/jobs/{id} 单条任务详情（前端轮询/详情用）。
+func (s *Server) shodanCollectJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("id")), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusBadRequest, "任务 id 非法")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), collectorTimeout)
+	defer cancel()
+	var out json.RawMessage
+	if err := collectorGet(ctx, "/jobs/"+strconv.FormatInt(id, 10), &out); err != nil {
+		if errors.Is(err, errCollectorNotFound) {
+			writeErr(w, http.StatusNotFound, "任务不存在")
+			return
+		}
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
 }
 
 func (s *Server) shodanCollectStatus(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +330,31 @@ func (s *Server) shodanCollectStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+// shodanCollectCancel POST /api/vuln/shodan-collect/jobs/{id}/cancel
+// 撤销待采集任务：只在 pending 阶段可撤（已开跑会烧 credit，不打断）。
+func (s *Server) shodanCollectCancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("id")), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusBadRequest, "任务 id 非法")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), collectorTimeout)
+	defer cancel()
+	if err := collectorCancel(ctx, id); err != nil {
+		switch {
+		case errors.Is(err, errCollectorNotFound):
+			writeErr(w, http.StatusNotFound, "任务不存在")
+		case errors.Is(err, errJobNotCancellable):
+			writeErr(w, http.StatusConflict, err.Error())
+		default:
+			writeErr(w, http.StatusBadGateway, err.Error())
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"job_id": id, "status": "cancelled"})
 }
 
 // ---- Agent 工具 shodan_collect（与 vuln 工具同模式，绑 auto+worker）----
@@ -210,12 +380,28 @@ func (s *Server) toolShodanCollect() actool.CoreTool {
 		}
 		_ = json.Unmarshal(in, &a)
 		if a.Status {
+			// status=true 不只回聚合计数，还带最近 5 条任务：Agent 排查「我提交的那条
+			// 跑没跑」时，光看 pending/running 计数没用（kt-vuln#73）。
 			stats, err := collectorStats(ctx)
 			if err != nil {
 				return actool.Result{}, err
 			}
-			b, _ := json.MarshalIndent(stats, "", " ")
-			return actool.Text("采集队列概览（按状态计数的 job 数）：\n" + string(b)), nil
+			var recent struct {
+				Items []queueCloudJob `json:"items"`
+				Total int64           `json:"total"`
+			}
+			if err := collectorGet(ctx, "/jobs?limit=5", &recent); err != nil {
+				// 列表失败不掩盖概览：能给的先给。
+				b, _ := json.MarshalIndent(stats, "", " ")
+				return actool.Text("采集队列概览（按状态计数的 job 数）：\n" + string(b) +
+					"\n（最近任务列表拉取失败：" + err.Error() + "）"), nil
+			}
+			b, _ := json.MarshalIndent(struct {
+				Stats  map[string]int64 `json:"stats"`
+				Total  int64            `json:"total"`
+				Recent []queueCloudJob  `json:"recent"`
+			}{stats, recent.Total, recent.Items}, "", " ")
+			return actool.Text("采集队列概览 + 最近 5 条任务：\n" + string(b)), nil
 		}
 		a.Query = strings.TrimSpace(a.Query)
 		if a.Query == "" {
@@ -225,7 +411,7 @@ func (s *Server) toolShodanCollect() actool.CoreTool {
 		if a.CveID != "" {
 			reason = "artex:cve:" + a.CveID
 		}
-		jobID, err := collectorEnqueue(ctx, a.Query, a.MaxPages, reason, "artex-agent")
+		jobID, err := collectorEnqueue(ctx, a.Query, a.MaxPages, reason, a.CveID, "artex-agent")
 		if err != nil {
 			return actool.Result{}, err
 		}
