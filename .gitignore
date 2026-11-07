@@ -62,3 +62,7 @@ Thumbs.db
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+
+# 本地联调脚本编译产物（scripts/dev/*）
+/scripts/dev/fake-collector/fake-collector
+/scripts/dev/fake-vuln/fake-vuln

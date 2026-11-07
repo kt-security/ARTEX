@@ -136,6 +136,127 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /vuln/shodan-collect/jobs:
+    get:
+      summary: 分页查询 Shodan 采集任务（admin）
+      description: 透传采集器任务读模型，供「采集任务」页和 CVE 详情回看使用。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, running, retry, paused, done, failed, interrupted, aborted, cancelled]
+        - name: cve_id
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 200
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100000
+            default: 0
+      responses:
+        "200":
+          description: 采集任务页
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VulnCollectJobPage"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+  /vuln/shodan-collect/jobs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+    get:
+      summary: 查询单条采集任务（admin）
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 任务详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VulnCollectJob"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+  /vuln/shodan-collect/jobs/{id}/cancel:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+    post:
+      summary: 撤销尚未开始的采集任务（admin）
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 已撤销
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id, status]
+                properties:
+                  job_id:
+                    type: integer
+                    format: int64
+                  status:
+                    type: string
+                    enum: [cancelled]
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
 components:
   securitySchemes:
     bearerAuth:
@@ -399,3 +520,59 @@ components:
           type: string
           format: date-time
       additionalProperties: true
+    VulnCollectJob:
+      type: object
+      required: [id, query, status, max_pages]
+      properties:
+        id:
+          type: integer
+          format: int64
+        query:
+          type: string
+        max_pages:
+          type: integer
+        priority:
+          type: integer
+        reason:
+          type: string
+        cve_id:
+          type: string
+        created_by:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, retry, paused, done, failed, interrupted, aborted, cancelled]
+        last_page:
+          type: integer
+        credits_spent:
+          type: integer
+          format: int64
+        assets_written:
+          type: integer
+          format: int64
+        note:
+          type: string
+        claimed_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+    VulnCollectJobPage:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/VulnCollectJob"
+        total:
+          type: integer
+          format: int64
+        limit:
+          type: integer
+        offset:
+          type: integer

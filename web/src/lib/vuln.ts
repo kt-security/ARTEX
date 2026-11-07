@@ -100,6 +100,47 @@ export interface VulnAssetFilters {
 }
 
 export type VulnRatingTier = "S" | "A" | "B" | "C" | "D" | "exclude";
+
+// Shodan 采集任务（shodan_collect_jobs 一行，经 ARTEX /api/vuln/shodan-collect/jobs
+// 代理读取）。kt-vuln#73：提交后任务不再"消失"，而是能在「采集任务」页看到
+// 状态/页数进度/写入条数/额度消耗/失败原因。
+export type VulnCollectJobStatus =
+  | "pending"
+  | "running"
+  | "retry"
+  | "paused"
+  | "done"
+  | "failed"
+  | "interrupted"
+  | "aborted"
+  | "cancelled";
+
+export interface VulnCollectJob {
+  id: number;
+  query: string;
+  max_pages: number;
+  priority?: number;
+  reason?: string;
+  cve_id?: string;
+  created_by?: string;
+  status: VulnCollectJobStatus | string;
+  last_page: number;
+  credits_spent: number;
+  assets_written: number;
+  note?: string;
+  claimed_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface VulnCollectJobFilters {
+  status?: string;
+  cve_id?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}
+
 export type VulnEngagementStatus =
   | "todo"
   | "claimed"
@@ -152,6 +193,40 @@ export function readVulnWorksetDraft(): VulnWorksetItem[] {
 
 export function clearVulnWorksetDraft() {
   sessionStorage.removeItem(VULN_WS_DRAFT_KEY);
+}
+
+export type VulnCveSyncState = "idle" | "running" | "succeeded" | "failed";
+
+export interface VulnCveSyncStatus {
+  source: "nvd";
+  status: VulnCveSyncState;
+  trigger: string;
+  cursor: string | null;
+  checkpoint_start: string | null;
+  checkpoint_end: string | null;
+  next_start_index: number;
+  total_results: number;
+  items_upserted: number;
+  started_at: string | null;
+  finished_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  updated_at: string;
+}
+
+export interface VulnCveSyncAccepted {
+  accepted: boolean;
+  status: VulnCveSyncStatus;
+}
+
+export class VulnApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "VulnApiError";
+    this.status = status;
+  }
 }
 
 const MISSING_IDENTITY_MSG = "缺少 KT Identity 令牌，请退出后通过 Telegram 重新登录";
@@ -219,7 +294,7 @@ async function vulnHttp<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // 空/非 JSON 响应保留状态码兜底信息。
     }
-    throw new Error(message);
+    throw new VulnApiError(message, r.status);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -271,6 +346,10 @@ export const vuln = {
   cveCatalogYears: () =>
     vulnHttp<{ items: { year: number; count: number }[] | null }>("/cve-catalog/years").then((r) => r.items ?? []),
 
+  cveSyncStatus: () => vulnHttp<VulnCveSyncStatus>("/cve-catalog/sync"),
+
+  triggerCveSync: () => vulnHttp<VulnCveSyncAccepted>("/cve-catalog/sync", { method: "POST" }),
+
   // 人工评级（单资产）：404 = 资产不存在。
   rate: (assetId: number, tier: VulnRatingTier, note?: string) =>
     vulnHttp<{ ok: boolean }>("/ratings", {
@@ -293,6 +372,45 @@ export const vuln = {
         note: note?.trim() ? note.trim() : undefined,
       }),
     }),
+
+  // ---- Shodan 采集队列（kt-vuln#73 可观测性）----
+  // 这组端点由 ARTEX 自己实现（server/shodan_collect.go），不走 kt-vuln 代理、
+  // 也不需要 KT Identity 令牌——只认 ARTEX JWT + admin 角色。因此用 http()
+  // 而不是上面的 vulnHttp()：后者缺 identity 令牌会直接抛错，会把没绑 Telegram
+  // 的管理员挡在任务页门外。
+  //
+  // 入队：返回 job_id；同 query 的 pending job 幂等合并，返回的可能是已有 job。
+  shodanCollect: (input: { query: string; cve_id?: string; max_pages?: number }) =>
+    http<{ job_id: number; query: string; cve_id?: string; message?: string }>("/vuln/shodan-collect", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  // 逐任务列表：status/cve_id/q 过滤 + limit/offset 分页（服务端 limit 上限 200）。
+  // init 用于把 AbortSignal 带进 fetch：轮询/切换筛选时取消旧请求，卸载时停止写状态。
+  shodanCollectJobs: (filters: VulnCollectJobFilters = {}, init?: RequestInit) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(filters)) {
+      if (v === undefined || v === "") continue;
+      if (typeof v === "number" && !Number.isFinite(v)) continue;
+      p.set(k, String(v));
+    }
+    const qs = p.toString();
+    return http<{ items: VulnCollectJob[] | null; total: number; limit?: number; offset?: number }>(
+      `/vuln/shodan-collect/jobs${qs ? `?${qs}` : ""}`,
+      init,
+    ).then((r) => ({ items: r.items ?? [], total: r.total ?? 0 }));
+  },
+
+  // 单条任务详情（轮询进度用）。
+  shodanCollectJob: (id: number) => http<VulnCollectJob>(`/vuln/shodan-collect/jobs/${id}`),
+
+  // 撤销待采集任务：只对 pending 生效（已开跑返回 409，避免打断正在写资产的 worker）。
+  shodanCollectCancel: (id: number) =>
+    http<{ job_id: number; status: string }>(`/vuln/shodan-collect/jobs/${id}/cancel`, { method: "POST" }),
+
+  // 队列聚合计数（按 status 计数），列表页顶部概览用。
+  shodanCollectStats: () => http<Record<string, number>>("/vuln/shodan-collect/status"),
 
   // ---- 任务 Vuln 工作集（ARTEX 自有 API /api/tasks/{id}/vuln-workset）----
   // 注意：这两个不是 /api/vuln 代理（不带 X-Identity-Token 双头），走 lib/api
