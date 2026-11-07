@@ -104,7 +104,16 @@ export type VulnRatingTier = "S" | "A" | "B" | "C" | "D" | "exclude";
 // Shodan 采集任务（shodan_collect_jobs 一行，经 ARTEX /api/vuln/shodan-collect/jobs
 // 代理读取）。kt-vuln#73：提交后任务不再"消失"，而是能在「采集任务」页看到
 // 状态/页数进度/写入条数/额度消耗/失败原因。
-export type VulnCollectJobStatus = "pending" | "running" | "done" | "failed" | "cancelled";
+export type VulnCollectJobStatus =
+  | "pending"
+  | "running"
+  | "retry"
+  | "paused"
+  | "done"
+  | "failed"
+  | "interrupted"
+  | "aborted"
+  | "cancelled";
 
 export interface VulnCollectJob {
   id: number;

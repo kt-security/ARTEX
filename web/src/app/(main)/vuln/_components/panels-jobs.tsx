@@ -38,8 +38,12 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: "all", label: "全部状态" },
   { value: "pending", label: "待采集" },
   { value: "running", label: "采集中" },
+  { value: "retry", label: "等待重试" },
+  { value: "paused", label: "预算等待" },
   { value: "done", label: "已完成" },
   { value: "failed", label: "失败" },
+  { value: "interrupted", label: "待人工核对" },
+  { value: "aborted", label: "已终止" },
   { value: "cancelled", label: "已取消" },
 ];
 
@@ -47,8 +51,12 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
 const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
   pending: { label: "待采集", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400" },
   running: { label: "采集中", cls: "bg-sky-500/15 text-sky-600 dark:text-sky-400" },
+  retry: { label: "等待重试", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400" },
+  paused: { label: "预算等待", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400" },
   done: { label: "已完成", cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" },
   failed: { label: "失败", cls: "bg-rose-500/15 text-rose-600 dark:text-rose-400" },
+  interrupted: { label: "待人工核对", cls: "bg-orange-500/15 text-orange-600 dark:text-orange-400" },
+  aborted: { label: "已终止", cls: "bg-muted text-muted-foreground" },
   cancelled: { label: "已取消", cls: "bg-muted text-muted-foreground" },
 };
 
@@ -67,7 +75,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function isActive(job: VulnCollectJob): boolean {
-  return job.status === "pending" || job.status === "running";
+  return ["pending", "running", "retry", "paused"].includes(job.status);
 }
 
 function fmtTime(value?: string): string {

@@ -47,7 +47,7 @@ const (
 	// 任务列表参数上限：limit 与采集器/前端契约一致（默认 50、上限 200），
 	// offset 设硬上限，避免超大分页把采集器拖垮。
 	maxCollectPageSize = 200
-	maxCollectOffset   = 1_000_000
+	maxCollectOffset   = 100_000
 	maxCollectFilterQ  = 200
 )
 
@@ -305,7 +305,7 @@ func (s *Server) shodanCollectJobs(w http.ResponseWriter, r *http.Request) {
 
 	status := strings.TrimSpace(q.Get("status"))
 	switch status {
-	case "", "pending", "running", "done", "failed", "cancelled":
+	case "", "pending", "running", "retry", "paused", "done", "failed", "interrupted", "aborted", "cancelled":
 		if status != "" {
 			vals.Set("status", status)
 		}

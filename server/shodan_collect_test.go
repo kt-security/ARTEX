@@ -191,6 +191,31 @@ func TestShodanCollectJobsRejectsInvalidFilters(t *testing.T) {
 	}
 }
 
+func TestShodanCollectJobsAcceptsCollectorStatuses(t *testing.T) {
+	for _, status := range []string{
+		"pending", "running", "retry", "paused", "done",
+		"failed", "interrupted", "aborted", "cancelled",
+	} {
+		t.Run(status, func(t *testing.T) {
+			var gotQuery string
+			upstream := newCollectorTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"items":[],"total":0}`)
+			})
+			defer upstream.Close()
+			s := &Server{}
+			req := httptest.NewRequest(http.MethodGet,
+				"/api/vuln/shodan-collect/jobs?status="+status, nil)
+			rec := httptest.NewRecorder()
+			s.shodanCollectJobs(rec, req)
+			if rec.Code != http.StatusOK || !strings.Contains(gotQuery, "status="+status) {
+				t.Fatalf("status=%s code=%d query=%q", status, rec.Code, gotQuery)
+			}
+		})
+	}
+}
+
 // TestShodanCollectJobsClampsPageSize 超大 limit/offset 收敛到上限，再编码透传。
 func TestShodanCollectJobsClampsPageSize(t *testing.T) {
 	var gotQuery string
@@ -212,7 +237,7 @@ func TestShodanCollectJobsClampsPageSize(t *testing.T) {
 	if !strings.Contains(gotQuery, "limit=200") {
 		t.Fatalf("limit 未收敛到 %d: %q", maxCollectPageSize, gotQuery)
 	}
-	if !strings.Contains(gotQuery, "offset=1000000") {
+	if !strings.Contains(gotQuery, "offset=100000") {
 		t.Fatalf("offset 未收敛到 %d: %q", maxCollectOffset, gotQuery)
 	}
 	if !strings.Contains(gotQuery, "status=running") {

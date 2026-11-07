@@ -39,6 +39,7 @@ import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 import { analyzeCollectQuery, collectQuerySuggestions } from "@/lib/shodan-query";
 import { cn } from "@/lib/utils";
 import {
@@ -601,6 +602,7 @@ export function cveEmptyMessage(loading: boolean, error: string): string {
 // CVE 情报面板：CVE 列表（客户端过滤）+ 「查看资产」下钻（懒加载：点开才发起 cve 筛选查询）。
 export function VulnCvesPanel({ refreshKey }: { refreshKey: number }) {
   const router = useRouter();
+  const isAdmin = useIsAdmin();
   const [items, setItems] = React.useState<VulnCve[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
@@ -797,26 +799,30 @@ export function VulnCvesPanel({ refreshKey }: { refreshKey: number }) {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7"
-                          onClick={() => collectCve(c, affected)}
-                          title="按影响组件构造 Shodan 查询（可修改），入队后自动采集入库"
-                        >
-                          采集
-                        </Button>
+                        {isAdmin ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7"
+                            onClick={() => collectCve(c, affected)}
+                            title="按影响组件构造 Shodan 查询（可修改），入队后自动采集入库"
+                          >
+                            采集
+                          </Button>
+                        ) : null}
                         <Button variant="outline" size="sm" className="h-7" onClick={() => setDrill(c)}>
                           查看资产
                         </Button>
-                        <Button variant="ghost" size="sm" className="h-7" asChild>
-                          <Link
-                            href={`/vuln/collect-jobs?cve=${encodeURIComponent(c.cve_id)}`}
-                            title="看该 CVE 发起过的采集任务"
-                          >
-                            任务
-                          </Link>
-                        </Button>
+                        {isAdmin ? (
+                          <Button variant="ghost" size="sm" className="h-7" asChild>
+                            <Link
+                              href={`/vuln/collect-jobs?cve=${encodeURIComponent(c.cve_id)}`}
+                              title="看该 CVE 发起过的采集任务"
+                            >
+                              任务
+                            </Link>
+                          </Button>
+                        ) : null}
                       </div>
                     </TableCell>
                   </TableRow>
@@ -882,6 +888,7 @@ export function VulnCollectDialog({
 }) {
   // 低精度查询的二次确认闸门：换了查询体就重置，避免"上次点过就一路放行"。
   const [confirmedWeak, setConfirmedWeak] = React.useState(false);
+  const analysisId = React.useId();
   const query = target?.query ?? "";
   React.useEffect(() => {
     setConfirmedWeak(false);
@@ -898,7 +905,10 @@ export function VulnCollectDialog({
     : [];
   const needConfirm = analysis.level !== "precise";
 
+  const canSubmit = query.trim() !== "";
+
   const submit = () => {
+    if (!canSubmit) return;
     if (needConfirm && !confirmedWeak) {
       setConfirmedWeak(true);
       return;
@@ -925,6 +935,7 @@ export function VulnCollectDialog({
                   <button
                     key={s.query}
                     type="button"
+                    aria-pressed={query.trim() === s.query}
                     className={cn(
                       "flex items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition-colors",
                       query.trim() === s.query
@@ -968,6 +979,7 @@ export function VulnCollectDialog({
             <Input
               id="shodan-collect-query"
               autoFocus
+              aria-describedby={analysisId}
               placeholder='如 product:"Apache Solr" country:CN'
               value={query}
               onChange={(e) => onQueryChange(e.target.value)}
@@ -976,9 +988,11 @@ export function VulnCollectDialog({
               }}
             />
             {analysis.level === "precise" ? (
-              <p className="text-muted-foreground text-xs">含识别型 filter，精度较高。</p>
+              <p id={analysisId} className="text-muted-foreground text-xs">
+                含识别型 filter，精度较高。
+              </p>
             ) : (
-              <p className="text-amber-600 dark:text-amber-400 text-xs leading-relaxed">
+              <p id={analysisId} className="text-amber-600 dark:text-amber-400 text-xs leading-relaxed">
                 {analysis.warning}
               </p>
             )}
@@ -991,10 +1005,18 @@ export function VulnCollectDialog({
           <Button
             size="sm"
             variant={needConfirm && confirmedWeak ? "destructive" : "default"}
-            disabled={busy}
+            disabled={busy || !canSubmit}
             onClick={submit}
           >
-            {busy ? "入队中…" : needConfirm ? (confirmedWeak ? "确认低精度入队" : "低精度，仍要入队") : "入队采集"}
+            {busy
+              ? "入队中…"
+              : !canSubmit
+                ? "请填写查询体"
+                : needConfirm
+                  ? confirmedWeak
+                    ? "确认低精度入队"
+                    : "低精度，仍要入队"
+                  : "入队采集"}
           </Button>
         </DialogFooter>
       </DialogContent>
