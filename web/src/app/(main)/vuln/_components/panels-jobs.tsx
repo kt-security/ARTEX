@@ -19,7 +19,6 @@ import Link from "next/link";
 import { ExternalLinkIcon, RefreshCwIcon, SearchIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { FieldLabel } from "@/components/ui/field";
@@ -27,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 import { cn } from "@/lib/utils";
 import { type VulnCollectJob, vuln } from "@/lib/vuln";
 
@@ -40,6 +40,7 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: "running", label: "采集中" },
   { value: "done", label: "已完成" },
   { value: "failed", label: "失败" },
+  { value: "cancelled", label: "已取消" },
 ];
 
 // 状态 → 文案与配色。未知状态原样展示，不吞字段。
@@ -92,28 +93,44 @@ export function VulnCollectJobsPanel({
   const [jobs, setJobs] = React.useState<VulnCollectJob[]>([]);
   const [total, setTotal] = React.useState(0);
   const [page, setPage] = React.useState(0);
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [cancelling, setCancelling] = React.useState<number | null>(null);
   const reqRef = React.useRef(0);
+  const abortRef = React.useRef<AbortController | null>(null);
+
+  // 卸载时取消在途请求，避免轮询/翻页的迟到响应继续 setState。
+  React.useEffect(
+    () => () => {
+      abortRef.current?.abort();
+    },
+    [],
+  );
 
   const load = React.useCallback(
     async (opts: { silent?: boolean } = {}) => {
       const seq = ++reqRef.current;
+      // 新请求取代旧请求：轮询与手动刷新同时发生时只保留最新一份。
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
       if (!opts.silent) setLoading(true);
       try {
-        const r = await vuln.shodanCollectJobs({ ...applied, limit: PAGE_SIZE, offset: page * PAGE_SIZE });
-        if (seq !== reqRef.current) return; // 竞态：只认最后一次请求
+        const r = await vuln.shodanCollectJobs(
+          { ...applied, limit: PAGE_SIZE, offset: page * PAGE_SIZE },
+          { signal: controller.signal },
+        );
+        if (seq !== reqRef.current || controller.signal.aborted) return;
         setJobs(r.items);
         setTotal(r.total);
         setError("");
       } catch (e) {
-        if (seq !== reqRef.current) return;
+        if (controller.signal.aborted || seq !== reqRef.current) return;
         const msg = String((e as Error)?.message ?? e);
         setError(msg);
         if (!opts.silent) toast.error(`采集任务列表加载失败：${msg}`);
       } finally {
-        if (seq === reqRef.current) setLoading(false);
+        if (seq === reqRef.current && !controller.signal.aborted) setLoading(false);
       }
     },
     [applied, page],
@@ -241,18 +258,21 @@ export function VulnCollectJobsPanel({
           {runningCount > 0 ? (
             <span className="text-sky-600 dark:text-sky-400">{runningCount} 条采集中</span>
           ) : null}
-          {counts.done ? <span>已完成 {counts.done}</span> : null}
-          {counts.failed ? <span className="text-rose-600 dark:text-rose-400">失败 {counts.failed}</span> : null}
+          {counts.done ? <span>本页已完成 {counts.done}</span> : null}
+          {counts.failed ? <span className="text-rose-600 dark:text-rose-400">本页失败 {counts.failed}</span> : null}
         </div>
       </Card>
 
       {error ? (
-        <Card className="border-rose-500/40 p-3 text-sm text-rose-600 dark:text-rose-400">
+        <Card
+          role="alert"
+          className="border-rose-500/40 p-3 text-sm text-rose-600 dark:text-rose-400"
+        >
           列表加载失败：{error}
         </Card>
       ) : null}
 
-      <Card className="min-h-0 flex-1 overflow-auto p-0">
+      <Card className="min-h-0 flex-1 overflow-auto p-0" aria-busy={loading}>
         <Table>
           <TableHeader className="bg-muted/40 sticky top-0 z-10">
             <TableRow>
@@ -302,7 +322,11 @@ export function VulnCollectJobsPanel({
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-2">
-                      <Progress value={pct} className="h-1.5 w-20" />
+                      <Progress
+                        value={pct}
+                        className="h-1.5 w-20"
+                        aria-label={`任务 #${job.id} 采集进度 ${job.last_page}/${job.max_pages} 页`}
+                      />
                       <span className="text-muted-foreground font-mono text-[11px] tabular-nums">
                         {job.last_page}/{job.max_pages}
                       </span>
@@ -332,6 +356,7 @@ export function VulnCollectJobsPanel({
                         variant="ghost"
                         className="text-muted-foreground hover:text-rose-600 h-7 px-2 text-xs"
                         disabled={cancelling === job.id}
+                        aria-label={`撤销任务 #${job.id}`}
                         onClick={() => void cancelJob(job.id)}
                       >
                         {cancelling === job.id ? "撤销中…" : "撤销"}
@@ -381,32 +406,37 @@ export function VulnCollectJobsPanel({
 // CVE → 采集任务 → 写入资产 要形成闭环）。只依赖 ARTEX 自己的
 // /api/vuln/shodan-collect/jobs?cve_id=…，不经过 kt-vuln 代理，所以本地也能验。
 export function VulnCollectJobsForCve({ cveId, limit = 5 }: { cveId: string; limit?: number }) {
+  const isAdmin = useIsAdmin();
   const [jobs, setJobs] = React.useState<VulnCollectJob[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
 
   React.useEffect(() => {
-    let cancelled = false;
+    if (!isAdmin) return;
+    const controller = new AbortController();
     setLoading(true);
     vuln
-      .shodanCollectJobs({ cve_id: cveId, limit })
+      .shodanCollectJobs({ cve_id: cveId, limit }, { signal: controller.signal })
       .then((r) => {
-        if (cancelled) return;
+        if (controller.signal.aborted) return;
         setJobs(r.items);
         setError("");
       })
       .catch((e) => {
-        if (cancelled) return;
-        // 无权限/未配置采集器时静默降级成一句提示，不影响 CVE 详情本身。
+        if (controller.signal.aborted) return;
+        // 未配置采集器等后端错误降级成一句提示，不影响 CVE 详情本身。
         setError(String((e as Error)?.message ?? e));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!controller.signal.aborted) setLoading(false);
       });
     return () => {
-      cancelled = true;
+      controller.abort();
     };
-  }, [cveId, limit]);
+  }, [cveId, limit, isAdmin]);
+
+  // 采集接口是 admin 门：非管理员不渲染、也不发请求（隐藏不替代后端 403）。
+  if (!isAdmin) return null;
 
   return (
     <div className="flex flex-col gap-2">
@@ -417,9 +447,13 @@ export function VulnCollectJobsForCve({ cveId, limit = 5 }: { cveId: string; lim
         </Button>
       </div>
       {loading ? (
-        <p className="text-muted-foreground text-xs">加载中…</p>
+        <p role="status" className="text-muted-foreground text-xs">
+          加载中…
+        </p>
       ) : error ? (
-        <p className="text-muted-foreground text-xs">任务读取失败：{error}</p>
+        <p role="alert" className="text-muted-foreground text-xs">
+          任务读取失败：{error}
+        </p>
       ) : jobs.length === 0 ? (
         <p className="text-muted-foreground text-xs">该 CVE 还没有发起过采集。</p>
       ) : (

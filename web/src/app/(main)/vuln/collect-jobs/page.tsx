@@ -7,21 +7,40 @@
 
 import * as React from "react";
 
-import { RefreshCwIcon } from "lucide-react";
+import { RefreshCwIcon, ShieldAlertIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 
 import { VulnCollectJobsPanel } from "../_components/panels-jobs";
 
 function VulnCollectJobsContent() {
+  const isAdmin = useIsAdmin();
   const [refreshKey, setRefreshKey] = React.useState(0);
   // 支持从 CVE 详情/任务行直接跳到「该 CVE 的采集任务」（与 /vuln/assets?cve= 同一约定）。
   const [cve, setCve] = React.useState<string | undefined>(undefined);
 
   React.useEffect(() => {
     const value = new URLSearchParams(window.location.search).get("cve");
-    setCve(value?.trim() ? value.trim() : undefined);
+    // 深链长度设上限：异常长的 ?cve= 不往后端带（后端也会再收敛一次）。
+    setCve(value?.trim() ? value.trim().slice(0, 64) : undefined);
   }, []);
+
+  if (isAdmin !== true) {
+    return (
+      <div className="flex h-[calc(100vh-6rem)] min-h-0 flex-col gap-4">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">采集任务</h1>
+          <p className="text-sm text-muted-foreground">Shodan 采集队列 · 仅管理员可见</p>
+        </div>
+        <Card role="status" className="flex flex-row items-center gap-2 p-4 text-sm">
+          <ShieldAlertIcon className="size-4 shrink-0" />
+          {isAdmin === null ? "正在校验权限…" : "需要管理员权限（采集任务包含额度消耗与队列明细）。"}
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-[calc(100vh-6rem)] min-h-0 flex-col gap-4">

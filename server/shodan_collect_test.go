@@ -165,3 +165,101 @@ func TestShodanCollectNotConfigured(t *testing.T) {
 		t.Fatalf("错误信息应点名缺失的环境变量: %s", rec.Body.String())
 	}
 }
+
+// TestShodanCollectJobsRejectsInvalidFilters 列表参数在本站收敛，不把原始输入
+// 直接拼给采集器：非法 status / 负 limit / 超长 q 一律 400。
+func TestShodanCollectJobsRejectsInvalidFilters(t *testing.T) {
+	cases := []string{
+		"?status=deleted",
+		"?limit=0",
+		"?limit=abc",
+		"?offset=-1",
+		"?q=" + strings.Repeat("a", maxCollectFilterQ+1),
+		"?cve_id=" + strings.Repeat("C", maxCollectCveIDLen+1),
+	}
+	for _, raw := range cases {
+		t.Run(raw, func(t *testing.T) {
+			// 不启上游：参数校验应先于任何网络调用。
+			s := &Server{}
+			req := httptest.NewRequest(http.MethodGet, "/api/vuln/shodan-collect/jobs"+raw, nil)
+			rec := httptest.NewRecorder()
+			s.shodanCollectJobs(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%s 期望 400，得到 %d: %s", raw, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestShodanCollectJobsClampsPageSize 超大 limit/offset 收敛到上限，再编码透传。
+func TestShodanCollectJobsClampsPageSize(t *testing.T) {
+	var gotQuery string
+	newCollectorTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"items":[],"total":0}`)
+	})
+
+	s := &Server{}
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/vuln/shodan-collect/jobs?limit=9999&offset=99999999&status=running", nil)
+	rec := httptest.NewRecorder()
+	s.shodanCollectJobs(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(gotQuery, "limit=200") {
+		t.Fatalf("limit 未收敛到 %d: %q", maxCollectPageSize, gotQuery)
+	}
+	if !strings.Contains(gotQuery, "offset=1000000") {
+		t.Fatalf("offset 未收敛到 %d: %q", maxCollectOffset, gotQuery)
+	}
+	if !strings.Contains(gotQuery, "status=running") {
+		t.Fatalf("status 未透传: %q", gotQuery)
+	}
+}
+
+// TestShodanCollectCapsMaxPages 入队页数封顶，避免一次调用烧穿月度 credit。
+func TestShodanCollectCapsMaxPages(t *testing.T) {
+	var body map[string]any
+	newCollectorTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"job_id":22,"query":"nginx"}`)
+	})
+
+	s := &Server{}
+	req := httptest.NewRequest(http.MethodPost, "/api/vuln/shodan-collect",
+		strings.NewReader(`{"query":"nginx","max_pages":100000}`))
+	rec := httptest.NewRecorder()
+	s.shodanCollect(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	if body["max_pages"].(float64) != maxCollectPages {
+		t.Fatalf("max_pages 应封顶为 %d，得到 %+v", maxCollectPages, body["max_pages"])
+	}
+}
+
+// TestShodanCollectRejectsOversizedQuery 超长 query/cve_id 在入队前拒绝。
+func TestShodanCollectRejectsOversizedQuery(t *testing.T) {
+	s := &Server{}
+	longQuery := strings.NewReader(`{"query":"` + strings.Repeat("a", maxCollectQueryLen+1) + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/vuln/shodan-collect", longQuery)
+	rec := httptest.NewRecorder()
+	s.shodanCollect(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超长 query 期望 400，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	longCve := strings.NewReader(`{"query":"nginx","cve_id":"` + strings.Repeat("C", maxCollectCveIDLen+1) + `"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/vuln/shodan-collect", longCve)
+	rec = httptest.NewRecorder()
+	s.shodanCollect(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超长 cve_id 期望 400，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}

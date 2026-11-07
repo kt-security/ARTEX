@@ -27,6 +27,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { SortableHead } from "@/components/ui/sortable-head";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import { type VulnCve, type VulnCveCatalogItem, vuln } from "@/lib/vuln";
 
@@ -84,6 +85,7 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
 
 export function VulnCvesCatalogPanel({ refreshKey }: { refreshKey: number }) {
   const router = useRouter();
+  const isAdmin = useIsAdmin();
   // 草稿筛选：输入中不触发请求，点「筛选」才提交（28 万条目录避免无谓翻页查询）。
   const [fq, setFq] = React.useState("");
   const [fYear, setFYear] = React.useState("all");
@@ -576,23 +578,25 @@ export function VulnCvesCatalogPanel({ refreshKey }: { refreshKey: number }) {
                           <SearchIcon className="size-3.5" />
                         </a>
                       </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-7"
-                        title="从 Shodan 采集该 CVE 的暴露资产"
-                        aria-label={`从 Shodan 采集 ${c.cve_id}`}
-                        onClick={() =>
-                          setCollectTarget({
-                            cve: { cve_id: c.cve_id, title: c.title ?? "" } as VulnCve,
-                            product: c.product?.trim() || null,
-                            vendor: c.vendor?.trim() || null,
-                            query: c.product?.trim() ? `product:"${c.product.trim()}"` : "",
-                          })
-                        }
-                      >
-                        <DownloadIcon className="size-3.5" />
-                      </Button>
+                      {isAdmin ? (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-7"
+                          title="从 Shodan 采集该 CVE 的暴露资产"
+                          aria-label={`从 Shodan 采集 ${c.cve_id}`}
+                          onClick={() =>
+                            setCollectTarget({
+                              cve: { cve_id: c.cve_id, title: c.title ?? "" } as VulnCve,
+                              product: c.product?.trim() || null,
+                              vendor: c.vendor?.trim() || null,
+                              query: c.product?.trim() ? `product:"${c.product.trim()}"` : "",
+                            })
+                          }
+                        >
+                          <DownloadIcon className="size-3.5" />
+                        </Button>
+                      ) : null}
                       <Button
                         variant="ghost"
                         size="icon"

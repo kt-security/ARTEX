@@ -378,7 +378,8 @@ export const vuln = {
     }),
 
   // 逐任务列表：status/cve_id/q 过滤 + limit/offset 分页（服务端 limit 上限 200）。
-  shodanCollectJobs: (filters: VulnCollectJobFilters = {}) => {
+  // init 用于把 AbortSignal 带进 fetch：轮询/切换筛选时取消旧请求，卸载时停止写状态。
+  shodanCollectJobs: (filters: VulnCollectJobFilters = {}, init?: RequestInit) => {
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(filters)) {
       if (v === undefined || v === "") continue;
@@ -388,6 +389,7 @@ export const vuln = {
     const qs = p.toString();
     return http<{ items: VulnCollectJob[] | null; total: number; limit?: number; offset?: number }>(
       `/vuln/shodan-collect/jobs${qs ? `?${qs}` : ""}`,
+      init,
     ).then((r) => ({ items: r.items ?? [], total: r.total ?? 0 }));
   },
 

@@ -31,11 +31,24 @@ import (
 )
 
 const (
-	envCollectorURL   = "COLLECTOR_URL"
-	envCollectorToken = "COLLECTOR_TOKEN"
+	envCollectorURL        = "COLLECTOR_URL"
+	envCollectorToken      = "COLLECTOR_TOKEN"
+	envCollectorSigningKey = "SIGAUTH_PRIVATE_KEY"
 
 	collectorUserAgent = "artex-shodan-collect/1.0"
 	collectorTimeout   = 15 * time.Second
+
+	// 入队参数上限：max_pages 每页 1 credit，不能让一次调用把月度额度烧穿；
+	// query/cve_id 长度上限用于挡住异常大请求，避免把采集器当任意文本通道。
+	maxCollectPages    = 50
+	maxCollectQueryLen = 512
+	maxCollectCveIDLen = 64
+
+	// 任务列表参数上限：limit 与采集器/前端契约一致（默认 50、上限 200），
+	// offset 设硬上限，避免超大分页把采集器拖垮。
+	maxCollectPageSize = 200
+	maxCollectOffset   = 1_000_000
+	maxCollectFilterQ  = 200
 )
 
 func collectorConfigured() bool {
@@ -45,7 +58,7 @@ func collectorConfigured() bool {
 // collectorAuthHeader 取调用采集器的 Authorization 值：优先 Ed25519 短时令牌
 // （SIGAUTH_PRIVATE_KEY，私钥只在本机），回落共享 COLLECTOR_TOKEN（迁移期）。
 func collectorAuthHeader() (string, error) {
-	if kv := strings.TrimSpace(os.Getenv("SIGAUTH_PRIVATE_KEY")); kv != "" {
+	if kv := strings.TrimSpace(os.Getenv(envCollectorSigningKey)); kv != "" {
 		signer, err := sigauth.ParsePriv(kv)
 		if err != nil {
 			return "", fmt.Errorf("SIGAUTH_PRIVATE_KEY 解析失败: %w", err)
@@ -63,7 +76,10 @@ func collectorAuthHeader() (string, error) {
 }
 
 func collectorConfiguredError() error {
-	return fmt.Errorf("管理员未配置 %s / %s（Shodan 采集器服务地址与令牌），采集功能暂不可用", envCollectorURL, envCollectorToken)
+	return fmt.Errorf(
+		"管理员未配置 %s，或采集器凭据（%s / %s），采集功能暂不可用",
+		envCollectorURL, envCollectorToken, envCollectorSigningKey,
+	)
 }
 
 // collectorEnqueue 入队一个采集 job；返回 (jobID, error)。
@@ -75,6 +91,9 @@ func collectorEnqueue(ctx context.Context, query string, maxPages int, reason, c
 	}
 	if maxPages <= 0 {
 		maxPages = 5
+	}
+	if maxPages > maxCollectPages {
+		maxPages = maxCollectPages
 	}
 	body, err := json.Marshal(map[string]any{
 		"query": query, "max_pages": maxPages,
@@ -249,6 +268,15 @@ func (s *Server) shodanCollect(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "query 必填（Shodan 查询体，如 \"log4j country:CN\"）")
 		return
 	}
+	if len(in.Query) > maxCollectQueryLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("query 过长（上限 %d 字符）", maxCollectQueryLen))
+		return
+	}
+	in.CveID = strings.TrimSpace(in.CveID)
+	if len(in.CveID) > maxCollectCveIDLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("cve_id 过长（上限 %d 字符）", maxCollectCveIDLen))
+		return
+	}
 	reason := "artex:manual"
 	if in.CveID != "" {
 		reason = "artex:cve:" + in.CveID
@@ -269,15 +297,64 @@ func (s *Server) shodanCollect(w http.ResponseWriter, r *http.Request) {
 
 // shodanCollectJobs GET /api/vuln/shodan-collect/jobs
 // 逐任务列表（kt-vuln#73 可观测性）：前端「采集任务」页的数据源。
-// 查询参数 status / cve_id / q / limit / offset 原样透传给采集器，非法值由采集器收敛。
+// 查询参数 status / cve_id / q / limit / offset 先在本站收敛（白名单、长度、
+// 取值范围），再用 url.Values 编码透传给采集器；不把原始输入直接拼进上游 URL。
 func (s *Server) shodanCollectJobs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	vals := url.Values{}
-	for _, k := range []string{"status", "cve_id", "q", "limit", "offset"} {
-		if v := strings.TrimSpace(q.Get(k)); v != "" {
-			vals.Set(k, v)
+
+	status := strings.TrimSpace(q.Get("status"))
+	switch status {
+	case "", "pending", "running", "done", "failed", "cancelled":
+		if status != "" {
+			vals.Set("status", status)
 		}
+	default:
+		writeErr(w, http.StatusBadRequest, "status 取值非法")
+		return
 	}
+
+	cveID := strings.TrimSpace(q.Get("cve_id"))
+	if len(cveID) > maxCollectCveIDLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("cve_id 过长（上限 %d 字符）", maxCollectCveIDLen))
+		return
+	}
+	if cveID != "" {
+		vals.Set("cve_id", cveID)
+	}
+
+	keyword := strings.TrimSpace(q.Get("q"))
+	if len(keyword) > maxCollectFilterQ {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("q 过长（上限 %d 字符）", maxCollectFilterQ))
+		return
+	}
+	if keyword != "" {
+		vals.Set("q", keyword)
+	}
+
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeErr(w, http.StatusBadRequest, "limit 必须是正整数")
+			return
+		}
+		if n > maxCollectPageSize {
+			n = maxCollectPageSize
+		}
+		vals.Set("limit", strconv.Itoa(n))
+	}
+	if raw := strings.TrimSpace(q.Get("offset")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "offset 必须是非负整数")
+			return
+		}
+		if n > maxCollectOffset {
+			n = maxCollectOffset
+		}
+		vals.Set("offset", strconv.Itoa(n))
+	}
+
 	path := "/jobs"
 	if enc := vals.Encode(); enc != "" {
 		path += "?" + enc
@@ -295,6 +372,7 @@ func (s *Server) shodanCollectJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(out)
 }
 
@@ -317,6 +395,7 @@ func (s *Server) shodanCollectJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Write(out)
 }
 
@@ -354,6 +433,7 @@ func (s *Server) shodanCollectCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(map[string]any{"job_id": id, "status": "cancelled"})
 }
 
@@ -406,6 +486,13 @@ func (s *Server) toolShodanCollect() actool.CoreTool {
 		a.Query = strings.TrimSpace(a.Query)
 		if a.Query == "" {
 			return actool.Result{}, fmt.Errorf("query 必填（Shodan 查询体，如 \"log4j country:CN\"）")
+		}
+		if len(a.Query) > maxCollectQueryLen {
+			return actool.Result{}, fmt.Errorf("query 过长（上限 %d 字符）", maxCollectQueryLen)
+		}
+		a.CveID = strings.TrimSpace(a.CveID)
+		if len(a.CveID) > maxCollectCveIDLen {
+			return actool.Result{}, fmt.Errorf("cve_id 过长（上限 %d 字符）", maxCollectCveIDLen)
 		}
 		reason := "artex:agent"
 		if a.CveID != "" {
