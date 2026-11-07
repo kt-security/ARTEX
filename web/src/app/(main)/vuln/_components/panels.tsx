@@ -7,6 +7,8 @@
 
 import * as React from "react";
 
+import Link from "next/link";
+
 import { useRouter } from "next/navigation";
 
 import { ArrowLeftIcon, PencilIcon, SendIcon } from "lucide-react";
@@ -37,6 +39,7 @@ import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { analyzeCollectQuery, collectQuerySuggestions } from "@/lib/shodan-query";
 import { cn } from "@/lib/utils";
 import {
   type VulnAsset,
@@ -597,6 +600,7 @@ export function cveEmptyMessage(loading: boolean, error: string): string {
 
 // CVE 情报面板：CVE 列表（客户端过滤）+ 「查看资产」下钻（懒加载：点开才发起 cve 筛选查询）。
 export function VulnCvesPanel({ refreshKey }: { refreshKey: number }) {
+  const router = useRouter();
   const [items, setItems] = React.useState<VulnCve[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
@@ -606,33 +610,36 @@ export function VulnCvesPanel({ refreshKey }: { refreshKey: number }) {
   const [drill, setDrill] = React.useState<VulnCve | null>(null);
   // Shodan 采集（#192）：弹窗确认查询后入队（无影响组件也可手填），admin 才能成功。
   const [collecting, setCollecting] = React.useState<string>("");
-  const [collectTarget, setCollectTarget] = React.useState<{ cve: VulnCve; query: string } | null>(null);
+  const [collectTarget, setCollectTarget] = React.useState<{
+    cve: VulnCve;
+    query: string;
+    product?: string | null;
+  } | null>(null);
 
+  // 预填精准指纹而不是裸关键词（kt-vuln#73 问题 1）：affected 的 key 就是影响组件名，
+  // 生成 product:"<组件>" 交给用户再叠 country/port。
   const collectCve = async (c: VulnCve, affected: [string, string[]][]) => {
-    const product = affected.length > 0 ? affected[0][0].trim().toLowerCase() : "";
-    setCollectTarget({ cve: c, query: product ? `${product} country:CN` : "" });
+    const product = affected.length > 0 ? affected[0][0].trim() : "";
+    setCollectTarget({
+      cve: c,
+      product: product || null,
+      query: product ? `product:"${product}"` : "",
+    });
   };
 
   const submitCollect = async () => {
     if (!collectTarget) return;
     const query = collectTarget.query.trim();
     if (!query) {
-      toast.error("请填写 Shodan 查询体，如 \"log4j country:CN\"");
+      toast.error("请填写 Shodan 查询体，如 product:\"Apache Solr\" country:CN");
       return;
     }
     setCollecting(collectTarget.cve.cve_id);
     try {
-      const resp = await fetch("/api/vuln/shodan-collect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, cve_id: collectTarget.cve.cve_id, max_pages: 5 }),
+      const data = await vuln.shodanCollect({ query, cve_id: collectTarget.cve.cve_id, max_pages: 5 });
+      toast.success(`已入队采集（job #${data.job_id}）：${query}`, {
+        action: { label: "看进度", onClick: () => router.push("/vuln/collect-jobs") },
       });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        toast.error(String(data?.error ?? `入队失败（HTTP ${resp.status}）`));
-        return;
-      }
-      toast.success(`已入队采集（job #${data.job_id}）：${query}，完成后资产自动入库`);
       setCollectTarget(null);
     } catch (e) {
       toast.error(`采集入队失败：${String((e as Error)?.message ?? e)}`);
@@ -802,6 +809,14 @@ export function VulnCvesPanel({ refreshKey }: { refreshKey: number }) {
                         <Button variant="outline" size="sm" className="h-7" onClick={() => setDrill(c)}>
                           查看资产
                         </Button>
+                        <Button variant="ghost" size="sm" className="h-7" asChild>
+                          <Link
+                            href={`/vuln/collect-jobs?cve=${encodeURIComponent(c.cve_id)}`}
+                            title="看该 CVE 发起过的采集任务"
+                          >
+                            任务
+                          </Link>
+                        </Button>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -845,8 +860,13 @@ function applyCountryFilter(query: string, code: string | null): string {
   return base ? `${base} country:${code}` : `country:${code}`;
 }
 
-// VulnCollectDialog Shodan 采集确认弹窗（关注清单/全量目录共用）：查询可编辑，
-// 无影响组件预填时手填。入队与错误反馈由调用方 submitCollect 完成。
+// VulnCollectDialog Shodan 采集确认弹窗（关注清单/全量目录共用）。
+//
+// kt-vuln#73 采集质量问题 1/2 的落点：以前只有一个空输入框 + 国家 chip，用户手填
+// 裸关键词（`solr country:US`）平台照单全收，实测 500 条 0 条命中。现在：
+//   1. 按 CVE 的影响组件生成「推荐查询」（product: / http.title: 精准指纹）一键填入；
+//   2. 输入框下方实时判定精度，裸关键词 / 纯端口过滤给显式风险文案；
+//   3. 低精度查询要二次确认（按钮文案变化），不再一键把噪声写进资产库。
 export function VulnCollectDialog({
   target,
   busy,
@@ -854,15 +874,41 @@ export function VulnCollectDialog({
   onClose,
   onSubmit,
 }: {
-  target: { cve: VulnCve; query: string } | null;
+  target: { cve: VulnCve; query: string; product?: string | null; vendor?: string | null } | null;
   busy: boolean;
   onQueryChange: (q: string) => void;
   onClose: () => void;
   onSubmit: () => void;
 }) {
+  // 低精度查询的二次确认闸门：换了查询体就重置，避免"上次点过就一路放行"。
+  const [confirmedWeak, setConfirmedWeak] = React.useState(false);
+  const query = target?.query ?? "";
+  React.useEffect(() => {
+    setConfirmedWeak(false);
+  }, [query, target?.cve.cve_id]);
+
+  const analysis = analyzeCollectQuery(query);
+  const suggestions = target
+    ? collectQuerySuggestions({
+        product: target.product,
+        vendor: target.vendor,
+        title: target.cve.title,
+        affected: target.cve.affected,
+      })
+    : [];
+  const needConfirm = analysis.level !== "precise";
+
+  const submit = () => {
+    if (needConfirm && !confirmedWeak) {
+      setConfirmedWeak(true);
+      return;
+    }
+    onSubmit();
+  };
+
   return (
     <Dialog open={target !== null} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>从 Shodan 采集{target ? ` · ${target.cve.cve_id}` : ""}</DialogTitle>
           <DialogDescription>
@@ -871,6 +917,29 @@ export function VulnCollectDialog({
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
+          {suggestions.length > 0 ? (
+            <Field>
+              <FieldLabel>推荐查询（精准指纹，优先用这个）</FieldLabel>
+              <div className="flex flex-col gap-1">
+                {suggestions.map((s) => (
+                  <button
+                    key={s.query}
+                    type="button"
+                    className={cn(
+                      "flex items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition-colors",
+                      query.trim() === s.query
+                        ? "border-primary/60 bg-primary/5"
+                        : "hover:bg-muted/60 border-border",
+                    )}
+                    onClick={() => onQueryChange(s.query)}
+                  >
+                    <span className="font-mono">{s.label}</span>
+                    <span className="text-muted-foreground shrink-0">{s.hint}</span>
+                  </button>
+                ))}
+              </div>
+            </Field>
+          ) : null}
           <Field>
             <FieldLabel>国家/地区（快捷）</FieldLabel>
             <div className="flex flex-wrap gap-1.5">
@@ -899,21 +968,33 @@ export function VulnCollectDialog({
             <Input
               id="shodan-collect-query"
               autoFocus
-              placeholder='如 "log4j country:CN"'
-              value={target?.query ?? ""}
+              placeholder='如 product:"Apache Solr" country:CN'
+              value={query}
               onChange={(e) => onQueryChange(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") onSubmit();
+                if (e.key === "Enter") submit();
               }}
             />
+            {analysis.level === "precise" ? (
+              <p className="text-muted-foreground text-xs">含识别型 filter，精度较高。</p>
+            ) : (
+              <p className="text-amber-600 dark:text-amber-400 text-xs leading-relaxed">
+                {analysis.warning}
+              </p>
+            )}
           </Field>
         </FieldGroup>
         <DialogFooter>
           <Button variant="ghost" size="sm" onClick={onClose}>
             取消
           </Button>
-          <Button size="sm" disabled={busy} onClick={onSubmit}>
-            {busy ? "入队中…" : "入队采集"}
+          <Button
+            size="sm"
+            variant={needConfirm && confirmedWeak ? "destructive" : "default"}
+            disabled={busy}
+            onClick={submit}
+          >
+            {busy ? "入队中…" : needConfirm ? (confirmedWeak ? "确认低精度入队" : "低精度，仍要入队") : "入队采集"}
           </Button>
         </DialogFooter>
       </DialogContent>
