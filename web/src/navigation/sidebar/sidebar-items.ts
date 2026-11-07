@@ -11,6 +11,7 @@ import {
   FolderOpen,
   FolderSync,
   LayoutDashboard,
+  ListChecks,
   type LucideIcon,
   MessageSquare,
   Network,
@@ -113,6 +114,9 @@ export const sidebarItems: NavGroup[] = [
     items: [
       { id: "vuln-cves", title: "CVE列表", url: "/vuln/cves", icon: Bug },
       { id: "vuln-assets", title: "情报", url: "/vuln/assets", icon: ShieldAlert },
+      // 采集任务（kt-vuln#73）：采集花 credit、任务明细含额度消耗，与后端
+      // /api/vuln/shodan-collect/* 的 admin 门对齐（隐藏不替代 403）。
+      { id: "vuln-collect-jobs", title: "采集任务", url: "/vuln/collect-jobs", icon: ListChecks, roles: ["admin"] },
     ],
   },
 ];
